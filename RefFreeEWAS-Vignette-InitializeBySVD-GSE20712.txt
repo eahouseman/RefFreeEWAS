@@ -1,0 +1,202 @@
+##################################################
+# VIGNETTE FOR R PACKAGE RefFreeEWAS
+#
+# 15 January 2019
+#
+# Using reference-free deconvolution of DNA methylation data
+# using SVD (PCA) as starting values
+#
+# Use data files in GSE20712Data.zip for this vignette!
+#
+################ ################ ################
+# Load libraries
+library(RefFreeEWAS)
+library(RColorBrewer)
+
+################ ################
+# Load data example
+# (GSE20712 from Gene Expression Omnibus)
+# https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE20712
+# Data from here: ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE20nnn/GSE20712/matrix/ 
+load("GSE20712.RData")
+
+Y.all = dataGSE.20712$assay 
+tumSelect = which(dataGSE.20712$pheno$Source=="Breast tumor")
+normSelect = which(dataGSE.20712$pheno$Source=="Normal breast tissue")
+tumClass = factor(dataGSE.20712$pheno$subtypeihc[tumSelect])
+tumColor = brewer.pal(length(levels(tumClass)),"Set1")
+
+########################
+# CpG selection by PCA
+
+sv = svd(scale(t(Y.all)))    # PCA
+plot(sv$d^2,type="b")    # Scree plot
+
+pcSelect =  sv$v[,1:7]  # Select first (7?) PCs
+
+# Mahalanobis distances of selected loadings
+mh = mahalanobis(pcSelect, apply(pcSelect,2,mean), cov(pcSelect))
+hist(mh)
+
+cpgSelect = order(mh, decreasing=TRUE)[1:5000]  # Select (5000?) most informative CpGs 
+
+Ysel = Y.all[cpgSelect,]
+
+########################
+# Cell mixture array with custom start (SVD)
+
+# Get PCs (without standardization)
+svSel = svd(Ysel)
+
+cellmixArray  <- RefFreeCellMixArrayWithCustomStart(Ysel, mu.start = svSel$u, Klist=1:12, iters=25)
+
+# Do the bootstrap for selecting the K parameter (# assumed cell types)
+cellmixArrayBoot <- RefFreeCellMixArrayDevianceBoots(
+   cellmixArray,            # Array object
+   Y=Ysel,                  # Data on which array was based
+   R=100,                   # 100 bootstraps for example
+   bootstrapIterations=10)  # num iterations per boot
+
+########################
+
+# Show winsorized mean deviance per K
+wnsrMeanDev <-apply(cellmixArrayBoot[-1,], 2, mean, trim=0.25)
+wnsrMeanDev
+
+# View bootstraps
+boxplot(cellmixArrayBoot[-1,],type="n")
+for(i in 1:100) lines(1:12,cellmixArrayBoot[1+i,],col=hsv(0,0,0.95),lty=2)
+boxplot(cellmixArrayBoot[-1,],add=TRUE)
+points(1:12, wnsrMeanDev, pch=19, col="blue")
+
+# Choose K based on minimum deviance
+Kchoose <- which.min(wnsrMeanDev)
+Kchoose
+
+# Chosen Omega
+Omega <- cellmixArray[[ Kchoose ]]$Omega # The cell mixture matrix
+MuSmall <- cellmixArray[[ Kchoose ]]$Mu
+
+# Visualize Mu matrix
+methPalette = colorRampPalette(c("yellow","black","blue"),space="Lab")(64)
+heatmap(MuSmall,scale="n",zlim=c(0,1),col=methPalette)
+
+# Visualize Omega matrix
+heatPalette = hsv(0.75,(0:100)/100,1)  # Heatmap color palette
+
+# Normal
+heatmap(Omega[normSelect,],scale="n",zlim=c(0,1),col=heatPalette)
+
+# Tumor
+heatmap(Omega[tumSelect,],scale="n",zlim=c(0,1),col=heatPalette,
+   RowSideColor=tumColor[as.numeric(tumClass)])
+
+########################
+# Get Mu for the entire array (not just the CpGs that were selected for deconvolution)
+Mu <- projectMix(t(Y.all), Omega)
+
+# Compare
+dim(Mu)
+dim(MuSmall)
+
+########################
+# Demonstrate how to look for associations between methylomes Mu and
+# genomic annotation data (Polycomb target genes in this case)
+PcG = read.delim("PcGTargets27K.txt", head=TRUE, stringsAsFactors=FALSE)
+
+# 27K annotation file
+annot = read.table("CpG-annotation-Infinium.txt",
+  sep="\t", head=TRUE, stringsAsFactors=FALSE)
+
+PcGScore = apply(as.matrix(PcG[,-(1:2)]), 1, sum)
+names(PcGScore) = PcG$EntrezGene.ID
+
+tmpPcG = rep(0,nrow(annot))
+names(tmpPcG) = annot$Entrez
+tmpIsect = intersect(names(tmpPcG),names(PcGScore))
+tmpPcG[tmpIsect] = PcGScore[tmpIsect]
+annot$PcG = tmpPcG
+
+all(rownames(Y.all)==annot$Name)
+v.Mu = apply(Mu,1,var)
+boxplot(v.Mu~pmin(annot$PcG,3))
+kruskal.test(v.Mu~pmin(annot$PcG,3))
+
+# Compare with principal components
+PCs = sv$v[,1:7]
+boxplot(sv$v[,1]~pmin(annot$PcG,3))
+kruskal.test(sv$v[,1]~pmin(annot$PcG,3))
+
+cor(Mu,pmin(annot$PcG,3))
+cor(PCs,pmin(annot$PcG,3))
+
+########################
+# Demonstrate how to look for associations between cell proportions 
+# (Omega) and phenotypic metadata
+
+# Create design matrix
+tmpData = dataGSE.20712$pheno[tumSelect,]
+tmpData$agebin = as.numeric(tmpData$agebin)
+tmpData$er = as.numeric(tmpData$er)
+tmpData$er[is.na(tmpData$er)] = 0
+tmpData$her2 = as.numeric(tmpData$her2)
+
+X = model.matrix(~agebin+subtypeihc+er,tmpData)
+colnames(X)=gsub("^subtypeihc","",colnames(X))
+colnames(X)[colnames(X)=="er"] = "ER"
+colnames(X)[colnames(X)=="agebin"] = "older"
+
+# Function for fitting GLM to all dimensions
+GetGLMFits = function(X,Om,family=quasibinomial()){
+  #Note: quasibinomial approximates a Dirichlet model
+  glmList <- list()
+  K = ncol(Om)
+  for(j in 1:K){
+     om <- Om[,j]
+     glmList[[j]] <- glm(om~X-1, family=family)
+  }
+  glmList
+}
+
+#Some values are numerically zero but still have negative sign
+range(Omega)
+Omega = abs(Omega) 
+
+glmFitList = GetGLMFits(X,Omega[tumSelect,])
+glmFitListPCA = GetGLMFits(X,sv$u[tumSelect,1:7],family=gaussian()) # Compare to PCA
+
+# Regression Coefficients for Age
+t(sapply(glmFitList, function(u)summary(u)$coef["Xolder",]))
+t(sapply(glmFitListPCA, function(u)summary(u)$coef["Xolder",]))
+
+# Regression Coefficients for Luminal-A
+t(sapply(glmFitList, function(u)summary(u)$coef["XLumA",]))
+t(sapply(glmFitListPCA, function(u)summary(u)$coef["XLumA",]))
+
+# Volcano Plots
+VolcanoByVariable = function(glmList,labelfun=function(x)x,legendpos="topleft",
+  labelPrefix="cell type", ncol=1){
+  tmp1 = t(sapply(glmList, function(u)summary(u)$coef[,1]))[,-1]
+  tmp2 = t(sapply(glmList, function(u)summary(u)$coef[,4]))[,-1]
+
+  xColor = brewer.pal(nrow(tmp1),"Set1")
+  xColor[xColor=="#FFFF33"]="black"
+  plot(tmp1,-log10(tmp2),col=xColor[row(tmp1)],pch=".",
+    xlab="Coefficient", ylab="-log10(p-value)")
+  tmp = (tmp2<0.1)
+  points(tmp1[!tmp],-log10(tmp2[!tmp]),col=xColor[row(tmp1)], pch=19)
+
+  labels=labelfun(gsub("^X","",colnames(tmp1)))
+  text(tmp1[tmp],-log10(tmp2[tmp]), 
+    labels[col(tmp1)[tmp]], cex=0.8, col=xColor[row(tmp1)[tmp]])
+  abline(h=-log10(0.05),lty=2,col="gray")
+  abline(h=-log10(0.05/nrow(tmp1)),lty=3,col="gray")
+  legend(legendpos,paste(labelPrefix,1:nrow(tmp1)),
+    cex=0.8,col=xColor,pch=19,ncol=ncol,text.col=xColor)
+}
+
+VolcanoByVariable(glmFitList,function(x)gsub("^subtypeihc","",x),"top",ncol=2)
+
+VolcanoByVariable(glmFitListPCA,legendpos="top",ncol=2,labelPrefix="dimension")
+
+
